@@ -1,7 +1,9 @@
 from snowflake.cli.api.sql_execution import SqlExecutionMixin
 from snowflake.connector.cursor import SnowflakeCursor
 from snowflakecli.nextflow.util.cmd_runner import CommandRunner
-from snowflakecli.nextflow.service_spec import Specification, Spec, Container, parse_stage_mounts, VolumeConfig, VolumeMount, Volume
+from snowflakecli.nextflow.service_spec import (
+    Specification, Spec, Container, parse_stage_mounts, VolumeConfig, VolumeMount, Volume, Endpoint
+)
 from dataclasses import dataclass
 from snowflake.cli.api.exceptions import CliError
 from snowflake.cli.api.console import cli_console as cc
@@ -12,13 +14,17 @@ from pathlib import Path
 import random
 import string
 from datetime import datetime
-from snowflake.cli._plugins.spcs.common import (
-    new_logs_only,
-    filter_log_timestamp,
-)
-from typing import List
-import time
 import json
+import asyncio
+from snowflakecli.nextflow.wss import (
+    WebSocketClient,
+    WebSocketError,
+    WebSocketConnectionError,
+    WebSocketAuthenticationError,
+    WebSocketInvalidURIError,
+    WebSocketServerError
+)
+from typing import Optional
 
 @dataclass
 class ProjectConfig:
@@ -143,9 +149,73 @@ class NextflowManager(SqlExecutionMixin):
         except Exception as e:
             raise CliError(f"Failed to create tarball: {str(e)}")
         
-    def _run_nextflow(self, config: ProjectConfig, tarball_path: str):
+    def _stream_service_logs(self, service_name: str) -> Optional[int]:
+        """
+        Connect to service WebSocket endpoint and stream logs.
+        
+        Args:
+            service_name: Name of the service to connect to
+            
+        Returns:
+            Exit code if execution completed successfully, None otherwise
+        """
+        # Get WebSocket endpoint
+        cursor = self.execute_query(f"show endpoints in service {service_name}")
+        wss_url = cursor.fetchone()[5]
+        
+        # Callback functions for WebSocket events
+        def on_message(message: str) -> None:
+            print(message, end='')
+        
+        def on_status(status: str, data: dict) -> None:
+            if status == 'starting':
+                cc.step(f"Starting: {data.get('command', '')}")
+            elif status == 'started':
+                cc.step(f"Started with PID: {data.get('pid', '')}")
+            elif status == 'connected':
+                cc.step(f"Connected to WebSocket server")
+                cc.step("Streaming live output... (Press Ctrl+C to stop)")
+                cc.step("=" * 50)
+            elif status == 'disconnected':
+                cc.step(f"Disconnected: {data.get('reason', '')}")
+        
+        def on_error(message: str, exception: Exception) -> None:
+            cc.warning(f"Processing error: {message}")
+        
+        exit_code = None
+        # Create WebSocket client and connect
+        try:
+            wss_client = WebSocketClient(
+                conn=self._conn,
+                message_callback=on_message,
+                status_callback=on_status,
+                error_callback=on_error
+            )
+            exit_code = asyncio.run(wss_client.connect_and_stream("wss://"+wss_url))
+        except WebSocketInvalidURIError as e:
+            raise CliError(f"Invalid WebSocket URL: {e}")
+        except WebSocketAuthenticationError as e:
+            raise CliError(f"Authentication failed: {e}")
+        except WebSocketConnectionError as e:
+            raise CliError(f"Connection failed: {e}")
+        except WebSocketServerError as e:
+            error_msg = f"Server error: {e}"
+            if e.error_code:
+                error_msg += f" (Code: {e.error_code})"
+            raise CliError(error_msg)
+        except WebSocketError as e:
+            raise CliError(f"WebSocket error: {e}")
+        except KeyboardInterrupt:
+            cc.step("Disconnected by user")
+        
+        return exit_code
+
+    def _submit_nextflow_job(self, config: ProjectConfig, tarball_path: str) -> Optional[int]:
         """
         Run the nextflow pipeline.
+        
+        Returns:
+            Exit code if execution completed successfully, None otherwise
         """
         tags = json.dumps({
             "NEXTFLOW_JOB_TYPE": "main",
@@ -161,7 +231,7 @@ class NextflowManager(SqlExecutionMixin):
         mkdir -p /mnt/project
         cd /mnt/project
         tar -zxf {workDir}/{tarball_filename}
-        nextflow run . -name {self._run_id} -ansi-log true -profile {self._profile} -work-dir /mnt/workdir -with-report /mnt/workdir/report.html -with-trace /mnt/workdir/trace.txt -with-timeline /mnt/workdir/timeline.html
+        python3 /app/pty_server.py -- nextflow run . -name {self._run_id} -ansi-log true -profile {self._profile} -work-dir /mnt/workdir -with-report /mnt/workdir/report.html -with-trace /mnt/workdir/trace.txt -with-timeline /mnt/workdir/timeline.html
         """
 
         config.volumeConfig.volumeMounts.append(VolumeMount(name="workdir", mountPath=workDir))
@@ -177,7 +247,10 @@ class NextflowManager(SqlExecutionMixin):
                         volumeMounts=config.volumeConfig.volumeMounts
                     )
                 ],
-                volumes = config.volumeConfig.volumes
+                volumes = config.volumeConfig.volumes,
+                endpoints = [
+                    Endpoint(name="wss", port=8765, public=True)
+                ]
             )
         )
         
@@ -185,92 +258,38 @@ class NextflowManager(SqlExecutionMixin):
         yaml_spec = spec.to_yaml()
 
         execute_sql = f"""
-EXECUTE JOB SERVICE
+CREATE SERVICE {self.service_name}
 IN COMPUTE POOL {config.computePool}
-NAME = '{self.service_name}'
 FROM SPECIFICATION $$
 {yaml_spec}
 $$
         """
         self.execute_query(execute_sql)
+        self.execute_query(f"call system$wait_for_services(30, '{self.service_name}')")
         self.execute_query("alter session unset query_tag")
 
-    def run(self) -> SnowflakeCursor:
+
+    def run(self) -> Optional[int]:
+        """
+        Run a Nextflow workflow.
+        
+        Returns:
+            Exit code if execution completed successfully, None otherwise
+        """
         cc.step("Parsing nextflow.config...")
         config = self._parse_config()
 
         tarball_path = None
-        with cc.phase("Uploading project..."):
+        with cc.phase("Uploading project to Snowflake..."):
             tarball_path = self._upload_project(config)
-        
-        cc.step("Submitting nextflow job...")
-        self._run_nextflow(config, tarball_path)
 
-    def logs(
-        self,
-        service_name: str,
-        instance_id: str,
-        container_name: str,
-        num_lines: int,
-        previous_logs: bool = False,
-        since_timestamp: str = "",
-        include_timestamps: bool = False,
-    ):
-        cursor = self.execute_query(
-            f"call SYSTEM$GET_SERVICE_LOGS('{service_name}', '{instance_id}', '{container_name}', "
-            f"{num_lines}, {previous_logs}, '{since_timestamp}', {include_timestamps});"
-        )
-
-        for log in cursor.fetchall():
-            yield log[0] if isinstance(log, tuple) else log
-
-    def stream_logs(
-        self,
-        service_name: str,
-        instance_id: str,
-        container_name: str,
-        num_lines: int,
-        since_timestamp: str,
-        include_timestamps: bool,
-        interval_seconds: int,
-    ):
-        try:
-            prev_timestamp = since_timestamp
-            prev_log_records: List[str] = []
-
-            while True:
-                raw_log_blocks = [
-                    log
-                    for log in self.logs(
-                        service_name=service_name,
-                        instance_id=instance_id,
-                        container_name=container_name,
-                        num_lines=num_lines,
-                        since_timestamp=prev_timestamp,
-                        include_timestamps=True,
-                    )
-                ]
-
-                new_log_records = []
-                for block in raw_log_blocks:
-                    new_log_records.extend(block.split("\n"))
-
-                new_log_records = [line for line in new_log_records if line.strip()]
-
-                if new_log_records:
-                    dedup_log_records = new_logs_only(prev_log_records, new_log_records)
-                    for log in dedup_log_records:
-                        yield filter_log_timestamp(log, include_timestamps)
-
-                    if len(dedup_log_records) > 0:
-                        prev_timestamp = dedup_log_records[-1].split(" ", 1)[0]
-                        prev_log_records = dedup_log_records
-
-                time.sleep(interval_seconds)
-
-        except KeyboardInterrupt:
-            return
+        try: 
+            cc.step("Submitting nextflow job to Snowflake...")
+            exit_code = self._submit_nextflow_job(config, tarball_path)
+            # Stream logs and get exit code
+            exit_code = self._stream_service_logs(self.service_name)
+        finally:
+            self.execute_query("drop service if exists "+self.service_name)
 
         
-        
-        
+        return exit_code

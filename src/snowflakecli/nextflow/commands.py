@@ -3,7 +3,6 @@ from snowflake.cli.api.commands.snow_typer import SnowTyperFactory
 from snowflake.cli.api.output.types import CommandResult, MessageResult, StreamResult
 from snowflakecli.nextflow.manager import NextflowManager
 from snowflake.cli._plugins.spcs.services.manager import ServiceManager
-import itertools
 from typing import Generator, Iterable, cast
 from snowflake.cli.api.console import cli_console as cc
 
@@ -29,21 +28,12 @@ def run_workflow(
     """
 
     manager = NextflowManager(project_dir, profile)
-    manager.run()
-
-    cc.step("Streaming logs...")
-    cc.step("================================================")
-    stream: Iterable[CommandResult] = (
-        MessageResult(log_batch)
-        for log_batch in manager.stream_logs(
-            service_name=manager.service_name,
-            container_name="nf-main",
-            instance_id="0",
-            num_lines=500,
-            since_timestamp="",
-            include_timestamps=False,
-            interval_seconds=1
-        )
-    )
-    stream = itertools.chain(stream, [MessageResult("")])
-    return StreamResult(cast(Generator[CommandResult, None, None], stream))
+    exit_code = manager.run()
+    
+    if exit_code is not None:
+        if exit_code == 0:
+            return MessageResult(f"Nextflow workflow completed successfully (exit code: {exit_code})")
+        else:
+            return MessageResult(f"Nextflow workflow completed with exit code: {exit_code}")
+    else:
+        return MessageResult("Nextflow workflow execution interrupted or failed to complete")
