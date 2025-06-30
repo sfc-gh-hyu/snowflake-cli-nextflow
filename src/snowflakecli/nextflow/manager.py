@@ -18,6 +18,7 @@ from snowflake.cli._plugins.spcs.common import (
 )
 from typing import List
 import time
+import json
 
 @dataclass
 class ProjectConfig:
@@ -39,8 +40,11 @@ class NextflowManager(SqlExecutionMixin):
         utc_timestamp = int(datetime.now().timestamp())
         random.seed(utc_timestamp)
         
-        # Generate 8-character alphanumeric runtime ID
-        self._run_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        # Generate 8-character runtime ID that complies with Nextflow naming requirements
+        # Must start with lowercase letter, followed by lowercase letters and digits
+        first_char = random.choice(string.ascii_lowercase)
+        remaining_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=7))
+        self._run_id = first_char + remaining_chars
         self.service_name = f"NXF_MAIN_{self._run_id}"
 
     def _parse_config(self) -> ProjectConfig:
@@ -143,6 +147,13 @@ class NextflowManager(SqlExecutionMixin):
         """
         Run the nextflow pipeline.
         """
+        tags = json.dumps({
+            "NEXTFLOW_JOB_TYPE": "main",
+            "NEXTFLOW_RUN_ID": self._run_id,
+        })
+
+        self.execute_query(f"alter session set query_tag = '{tags}'")
+
         workDir = "/mnt/workdir"
         tarball_filename = os.path.basename(tarball_path)
 
@@ -177,12 +188,12 @@ class NextflowManager(SqlExecutionMixin):
 EXECUTE JOB SERVICE
 IN COMPUTE POOL {config.computePool}
 NAME = '{self.service_name}'
-ASYNC = TRUE
 FROM SPECIFICATION $$
 {yaml_spec}
 $$
         """
         self.execute_query(execute_sql)
+        self.execute_query("alter session unset query_tag")
 
     def run(self) -> SnowflakeCursor:
         cc.step("Parsing nextflow.config...")
