@@ -16,7 +16,15 @@ import string
 from datetime import datetime
 import json
 import asyncio
-from snowflakecli.nextflow.util.websocket_client import WebSocketClient
+from snowflakecli.nextflow.wss import (
+    WebSocketClient,
+    WebSocketError,
+    WebSocketConnectionError,
+    WebSocketAuthenticationError,
+    WebSocketInvalidURIError,
+    WebSocketServerError
+)
+from typing import Optional
 
 @dataclass
 class ProjectConfig:
@@ -141,9 +149,73 @@ class NextflowManager(SqlExecutionMixin):
         except Exception as e:
             raise CliError(f"Failed to create tarball: {str(e)}")
         
-    def _run_nextflow(self, config: ProjectConfig, tarball_path: str):
+    def _stream_service_logs(self, service_name: str) -> Optional[int]:
+        """
+        Connect to service WebSocket endpoint and stream logs.
+        
+        Args:
+            service_name: Name of the service to connect to
+            
+        Returns:
+            Exit code if execution completed successfully, None otherwise
+        """
+        # Get WebSocket endpoint
+        cursor = self.execute_query(f"show endpoints in service {service_name}")
+        wss_url = cursor.fetchone()[5]
+        
+        # Callback functions for WebSocket events
+        def on_message(message: str) -> None:
+            print(message, end='')
+        
+        def on_status(status: str, data: dict) -> None:
+            if status == 'starting':
+                cc.step(f"Starting: {data.get('command', '')}")
+            elif status == 'started':
+                cc.step(f"Started with PID: {data.get('pid', '')}")
+            elif status == 'connected':
+                cc.step(f"Connected to WebSocket server")
+                cc.step("Streaming live output... (Press Ctrl+C to stop)")
+                cc.step("=" * 50)
+            elif status == 'disconnected':
+                cc.step(f"Disconnected: {data.get('reason', '')}")
+        
+        def on_error(message: str, exception: Exception) -> None:
+            cc.warning(f"Processing error: {message}")
+        
+        exit_code = None
+        # Create WebSocket client and connect
+        try:
+            wss_client = WebSocketClient(
+                conn=self._conn,
+                message_callback=on_message,
+                status_callback=on_status,
+                error_callback=on_error
+            )
+            exit_code = asyncio.run(wss_client.connect_and_stream("wss://"+wss_url))
+        except WebSocketInvalidURIError as e:
+            raise CliError(f"Invalid WebSocket URL: {e}")
+        except WebSocketAuthenticationError as e:
+            raise CliError(f"Authentication failed: {e}")
+        except WebSocketConnectionError as e:
+            raise CliError(f"Connection failed: {e}")
+        except WebSocketServerError as e:
+            error_msg = f"Server error: {e}"
+            if e.error_code:
+                error_msg += f" (Code: {e.error_code})"
+            raise CliError(error_msg)
+        except WebSocketError as e:
+            raise CliError(f"WebSocket error: {e}")
+        except KeyboardInterrupt:
+            cc.step("Disconnected by user")
+        
+        return exit_code
+
+    def _submit_nextflow_job(self, config: ProjectConfig, tarball_path: str) -> Optional[int]:
         """
         Run the nextflow pipeline.
+        
+        Returns:
+            Exit code if execution completed successfully, None otherwise
         """
         tags = json.dumps({
             "NEXTFLOW_JOB_TYPE": "main",
@@ -194,21 +266,30 @@ $$
         """
         self.execute_query(execute_sql)
         self.execute_query(f"call system$wait_for_services(30, '{self.service_name}')")
-        
-        cursor = self.execute_query(f"show endpoints in service {self.service_name}")
-        wss_url = cursor.fetchone()[5]
-        wss_client = WebSocketClient()
-        asyncio.run(wss_client.connect_and_stream("wss://"+wss_url))
-
         self.execute_query("alter session unset query_tag")
 
-    def run(self) -> SnowflakeCursor:
+
+    def run(self) -> Optional[int]:
+        """
+        Run a Nextflow workflow.
+        
+        Returns:
+            Exit code if execution completed successfully, None otherwise
+        """
         cc.step("Parsing nextflow.config...")
         config = self._parse_config()
 
         tarball_path = None
-        with cc.phase("Uploading project..."):
+        with cc.phase("Uploading project to Snowflake..."):
             tarball_path = self._upload_project(config)
+
+        try: 
+            cc.step("Submitting nextflow job to Snowflake...")
+            exit_code = self._submit_nextflow_job(config, tarball_path)
+            # Stream logs and get exit code
+            exit_code = self._stream_service_logs(self.service_name)
+        finally:
+            self.execute_query("drop service if exists "+self.service_name)
+
         
-        cc.step("Submitting nextflow job...")
-        self._run_nextflow(config, tarball_path)
+        return exit_code
