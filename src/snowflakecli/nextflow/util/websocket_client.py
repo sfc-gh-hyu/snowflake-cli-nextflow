@@ -27,6 +27,7 @@ class WebSocketClient(SqlExecutionMixin):
         """Get Snowflake session token for authentication"""
         # Access the connection context from SqlExecutionMixin
         ctx = self._conn
+        ctx.cursor().execute("alter session set python_connector_query_result_format = 'json'")
         # Get session token using the REST API
         token_data = ctx._rest._token_request('ISSUE')
         return token_data['data']['sessionToken']

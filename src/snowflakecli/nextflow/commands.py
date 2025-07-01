@@ -32,22 +32,6 @@ def run_workflow(
 
     manager = NextflowManager(project_dir, profile)
     manager.run()
-
-    cc.step("Streaming logs...")
-    cc.step("================================================")
-    stream: Iterable[CommandResult] = (
-        MessageResult(log_batch)
-        for log_batch in manager.stream_logs(
-            service_name=manager.service_name,
-            container_name="nf-main",
-            instance_id="0",
-            num_lines=500,
-            since_timestamp="",
-            include_timestamps=False,
-            interval_seconds=1
-        )
-    )
-    stream = itertools.chain(stream, [MessageResult("")])
     return StreamResult(cast(Generator[CommandResult, None, None], stream))
 
 @app.command("test", requires_connection=True)

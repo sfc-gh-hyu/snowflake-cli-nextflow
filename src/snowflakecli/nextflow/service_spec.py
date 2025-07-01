@@ -20,9 +20,16 @@ class Volume:
     source: str
 
 @dataclass
+class Endpoint:
+    name: str
+    port: int
+    public: bool
+
+@dataclass
 class Spec:
     containers: list[Container]
     volumes: list[Volume]
+    endpoints: list[Endpoint]
 
 @dataclass
 class Specification:

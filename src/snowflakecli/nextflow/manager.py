@@ -1,7 +1,9 @@
 from snowflake.cli.api.sql_execution import SqlExecutionMixin
 from snowflake.connector.cursor import SnowflakeCursor
 from snowflakecli.nextflow.util.cmd_runner import CommandRunner
-from snowflakecli.nextflow.service_spec import Specification, Spec, Container, parse_stage_mounts, VolumeConfig, VolumeMount, Volume
+from snowflakecli.nextflow.service_spec import (
+    Specification, Spec, Container, parse_stage_mounts, VolumeConfig, VolumeMount, Volume, Endpoint
+)
 from dataclasses import dataclass
 from snowflake.cli.api.exceptions import CliError
 from snowflake.cli.api.console import cli_console as cc
@@ -12,13 +14,9 @@ from pathlib import Path
 import random
 import string
 from datetime import datetime
-from snowflake.cli._plugins.spcs.common import (
-    new_logs_only,
-    filter_log_timestamp,
-)
-from typing import List
-import time
 import json
+import asyncio
+from snowflakecli.nextflow.util.websocket_client import WebSocketClient
 
 @dataclass
 class ProjectConfig:
@@ -161,7 +159,7 @@ class NextflowManager(SqlExecutionMixin):
         mkdir -p /mnt/project
         cd /mnt/project
         tar -zxf {workDir}/{tarball_filename}
-        nextflow run . -name {self._run_id} -ansi-log true -profile {self._profile} -work-dir /mnt/workdir -with-report /mnt/workdir/report.html -with-trace /mnt/workdir/trace.txt -with-timeline /mnt/workdir/timeline.html
+        python3 /app/pty_server.py -- nextflow run . -name {self._run_id} -ansi-log true -profile {self._profile} -work-dir /mnt/workdir -with-report /mnt/workdir/report.html -with-trace /mnt/workdir/trace.txt -with-timeline /mnt/workdir/timeline.html
         """
 
         config.volumeConfig.volumeMounts.append(VolumeMount(name="workdir", mountPath=workDir))
@@ -177,7 +175,10 @@ class NextflowManager(SqlExecutionMixin):
                         volumeMounts=config.volumeConfig.volumeMounts
                     )
                 ],
-                volumes = config.volumeConfig.volumes
+                volumes = config.volumeConfig.volumes,
+                endpoints = [
+                    Endpoint(name="wss", port=8765, public=True)
+                ]
             )
         )
         
@@ -185,14 +186,20 @@ class NextflowManager(SqlExecutionMixin):
         yaml_spec = spec.to_yaml()
 
         execute_sql = f"""
-EXECUTE JOB SERVICE
+CREATE SERVICE {self.service_name}
 IN COMPUTE POOL {config.computePool}
-NAME = '{self.service_name}'
 FROM SPECIFICATION $$
 {yaml_spec}
 $$
         """
         self.execute_query(execute_sql)
+        self.execute_query(f"call system$wait_for_services(30, '{self.service_name}')")
+        
+        cursor = self.execute_query(f"show endpoints in service {self.service_name}")
+        wss_url = cursor.fetchone()[5]
+        wss_client = WebSocketClient()
+        asyncio.run(wss_client.connect_and_stream("wss://"+wss_url))
+
         self.execute_query("alter session unset query_tag")
 
     def run(self) -> SnowflakeCursor:
@@ -205,72 +212,3 @@ $$
         
         cc.step("Submitting nextflow job...")
         self._run_nextflow(config, tarball_path)
-
-    def logs(
-        self,
-        service_name: str,
-        instance_id: str,
-        container_name: str,
-        num_lines: int,
-        previous_logs: bool = False,
-        since_timestamp: str = "",
-        include_timestamps: bool = False,
-    ):
-        cursor = self.execute_query(
-            f"call SYSTEM$GET_SERVICE_LOGS('{service_name}', '{instance_id}', '{container_name}', "
-            f"{num_lines}, {previous_logs}, '{since_timestamp}', {include_timestamps});"
-        )
-
-        for log in cursor.fetchall():
-            yield log[0] if isinstance(log, tuple) else log
-
-    def stream_logs(
-        self,
-        service_name: str,
-        instance_id: str,
-        container_name: str,
-        num_lines: int,
-        since_timestamp: str,
-        include_timestamps: bool,
-        interval_seconds: int,
-    ):
-        try:
-            prev_timestamp = since_timestamp
-            prev_log_records: List[str] = []
-
-            while True:
-                raw_log_blocks = [
-                    log
-                    for log in self.logs(
-                        service_name=service_name,
-                        instance_id=instance_id,
-                        container_name=container_name,
-                        num_lines=num_lines,
-                        since_timestamp=prev_timestamp,
-                        include_timestamps=True,
-                    )
-                ]
-
-                new_log_records = []
-                for block in raw_log_blocks:
-                    new_log_records.extend(block.split("\n"))
-
-                new_log_records = [line for line in new_log_records if line.strip()]
-
-                if new_log_records:
-                    dedup_log_records = new_logs_only(prev_log_records, new_log_records)
-                    for log in dedup_log_records:
-                        yield filter_log_timestamp(log, include_timestamps)
-
-                    if len(dedup_log_records) > 0:
-                        prev_timestamp = dedup_log_records[-1].split(" ", 1)[0]
-                        prev_log_records = dedup_log_records
-
-                time.sleep(interval_seconds)
-
-        except KeyboardInterrupt:
-            return
-
-        
-        
-        
