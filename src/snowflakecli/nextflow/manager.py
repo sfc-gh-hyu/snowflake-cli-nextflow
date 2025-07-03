@@ -34,13 +34,14 @@ class ProjectConfig:
 
 class NextflowManager(SqlExecutionMixin):
 
-    def __init__(self, project_dir: str, profile: str = None):
+    def __init__(self, project_dir: str, profile: str = None, nf_snowflake_image: str = None):
         super().__init__()
         self._project_dir = Path(project_dir)
         if not self._project_dir.exists() or not self._project_dir.is_dir():
             raise CliError(f"Invalid project directory '{project_dir}'")
 
         self._profile = profile
+        self._nf_snowflake_image = nf_snowflake_image
         
         # Generate random alphanumeric runtime ID using UTC timestamp and random seed
         utc_timestamp = int(datetime.now().timestamp())
@@ -227,22 +228,46 @@ class NextflowManager(SqlExecutionMixin):
         workDir = "/mnt/workdir"
         tarball_filename = os.path.basename(tarball_path)
 
+        nf_run_cmds = [
+            "nextflow",
+            "run",
+            ".",
+            "-name",
+            self._run_id,
+            "-ansi-log",
+            "true",
+            "-profile",
+            self._profile,
+            "-work-dir",
+            workDir,
+            "-with-report",
+            workDir+"/report.html",
+            "-with-trace",
+            workDir+"/trace.txt",
+            "-with-timeline",
+            workDir+"/timeline.html",
+        ]
+        
         run_script = f"""
         mkdir -p /mnt/project
         cd /mnt/project
         tar -zxf {workDir}/{tarball_filename}
-        python3 /app/pty_server.py -- nextflow run . -name {self._run_id} -ansi-log true -profile {self._profile} -work-dir /mnt/workdir -with-report /mnt/workdir/report.html -with-trace /mnt/workdir/trace.txt -with-timeline /mnt/workdir/timeline.html
+        python3 /app/pty_server.py -- {' '.join(nf_run_cmds)}
         """
 
-        config.volumeConfig.volumeMounts.append(VolumeMount(name="workdir", mountPath=workDir))
-        config.volumeConfig.volumes.append(Volume(name="workdir", source="@"+config.workDirStage+"/"+self._run_id+"/"))
+        config.volumeConfig.volumeMounts.append(
+            VolumeMount(name="workdir", mountPath=workDir)
+        )
+        config.volumeConfig.volumes.append(
+            Volume(name="workdir", source="@"+config.workDirStage+"/"+self._run_id+"/")
+        )
 
         spec = Specification(
             spec = Spec(
                 containers = [
                     Container(
                         name="nf-main",
-                        image="/HYU/PUBLIC/NF_REPO/nf-snowflake:1.0",
+                        image=self._nf_snowflake_image,
                         command=["/bin/bash", "-c", run_script],
                         volumeMounts=config.volumeConfig.volumeMounts
                     )
