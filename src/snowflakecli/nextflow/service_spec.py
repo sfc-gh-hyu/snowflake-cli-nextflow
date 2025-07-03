@@ -61,7 +61,7 @@ def parse_stage_mounts(stage_mounts: str) ->VolumeConfig:
             raise CliError("Invalid stage mount expression: " + stage_mounts[index])
 
         volume_name = "vol-" + str(index+1)
-        volumes.append(Volume(name=volume_name, source=mount[0]))
+        volumes.append(Volume(name=volume_name, source="@"+mount[0]))
         volume_mounts.append(VolumeMount(name=volume_name, mountPath=mount[1]))
 
     return VolumeConfig(volumes=volumes, volumeMounts=volume_mounts)

@@ -23,7 +23,7 @@ This plugin extends the Snowflake CLI with Nextflow workflow capabilities, allow
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- All prerequisites of running snowflake-cli mentioned [here](https://docs.snowflake.com/en/developer-guide/snowflake-cli/installation/installation#requirements)
 - Access to a Snowflake account with Snowpark Container Services enabled
 - A Snowflake compute pool configured for container workloads
 
@@ -95,7 +95,7 @@ snowflake {
 
 - **`computePool`** (Required): The name of your Snowflake compute pool where the Nextflow containers will run. This compute pool must be configured with appropriate resources and permissions for container workloads.
 
-- **`workDirStage`** (Required): The Snowflake stage name (without `@` prefix) where the plugin will upload your workflow files and store execution artifacts. This stage serves as the working directory for your Nextflow execution.
+- **`workDirStage`** (Required): The Snowflake stage name where the plugin will upload your workflow files and store execution artifacts. This stage serves as the working directory for your Nextflow execution.
 
 - **`stageMounts`** (Optional): A comma-separated list of stage mounts in the format `STAGE_NAME:/mount/path`. Each mount makes a Snowflake stage available inside the container at the specified path. Use this to provide input data and collect output results.
 

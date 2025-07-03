@@ -105,7 +105,7 @@ class NextflowManager(SqlExecutionMixin):
             
             cc.step(f"Uploading to stage {config.workDirStage}...")
             # Upload to Snowflake stage
-            self.execute_query(f"PUT file://{temp_tarball_path} {config.workDirStage}/{self._run_id}")
+            self.execute_query(f"PUT file://{temp_tarball_path} @{config.workDirStage}/{self._run_id}")
 
             return temp_tarball_path
             
@@ -235,7 +235,7 @@ class NextflowManager(SqlExecutionMixin):
         """
 
         config.volumeConfig.volumeMounts.append(VolumeMount(name="workdir", mountPath=workDir))
-        config.volumeConfig.volumes.append(Volume(name="workdir", source=config.workDirStage+"/"+self._run_id+"/"))
+        config.volumeConfig.volumes.append(Volume(name="workdir", source="@"+config.workDirStage+"/"+self._run_id+"/"))
 
         spec = Specification(
             spec = Spec(

@@ -19,8 +19,6 @@ class CommandRunner:
     def run(self, cmd: List[str]) -> int:
         try:
             env = os.environ.copy()
-            env["JAVA_HOME"] = "/usr/lib/jvm/temurin-17-jdk/"
-
             process = subprocess.Popen(
                 " ".join(cmd),
                 stdout=subprocess.PIPE,
